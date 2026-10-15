@@ -72,8 +72,19 @@ div[data-testid="stMetric"]:hover { transform:translateY(-3px); box-shadow:0 12p
 """, unsafe_allow_html=True)
 
 # ---------------------- Database PostgreSQL / Supabase ----------------------
-# Configurez DATABASE_URL dans les secrets de l'environnement, jamais dans le code.
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Secrets pris en charge depuis les variables d'environnement OU st.secrets
+# (Streamlit Community Cloud). Aucun identifiant n'est codé en dur.
+def secret_value(key, default=""):
+    value = os.environ.get(key)
+    if value is not None and value.strip():
+        return value.strip()
+    try:
+        value = st.secrets.get(key, default)
+        return str(value).strip() if value is not None else default
+    except Exception:
+        return default
+
+DATABASE_URL = secret_value("DATABASE_URL")
 
 class CursorCompat:
     """Adaptateur limité pour conserver les appels SQLite existants sans exposer SQL brut."""
@@ -115,10 +126,32 @@ class ConnectionCompat:
     def rollback(self): self.raw.rollback()
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL absent. Configurez-le dans les secrets de déploiement.")
-    raw = psycopg2.connect(DATABASE_URL, sslmode="verify-full", connect_timeout=10,
-                           application_name="ANTACARE")
+    connect_options = {
+        "sslmode": "verify-full",
+        "connect_timeout": 10,
+        "application_name": "ANTACARE",
+    }
+    if DATABASE_URL:
+        # sslmode est imposé ici même si l'URI fournie ne le contient pas.
+        raw = psycopg2.connect(DATABASE_URL, **connect_options)
+    else:
+        # Alternative recommandée sur Streamlit Cloud : champs TOML séparés,
+        # afin d'éviter les problèmes d'encodage du mot de passe dans une URI.
+        try:
+            cfg = st.secrets.get("supabase", {})
+        except Exception:
+            cfg = {}
+        host = str(cfg.get("host", "")).strip() if cfg else ""
+        if not host:
+            raise RuntimeError("Secrets Supabase absents : configurez [supabase] ou DATABASE_URL.")
+        raw = psycopg2.connect(
+            host=host,
+            port=int(cfg.get("port", 5432)),
+            dbname=str(cfg.get("dbname", "postgres")),
+            user=str(cfg.get("user", "")),
+            password=str(cfg.get("password", "")),
+            **connect_options,
+        )
     raw.set_session(autocommit=False)
     return ConnectionCompat(raw)
 
@@ -174,8 +207,16 @@ def init_db():
     with get_conn() as conn:
         conn.executescript(schema)
         # Pas de compte/mot de passe de démonstration codé en dur.
-        admin_password = os.environ.get("ANTACARE_ADMIN_PASSWORD", "")
-        username = os.environ.get("ANTACARE_ADMIN_USERNAME", "anta").strip()
+        admin_password = secret_value("ANTACARE_ADMIN_PASSWORD")
+        username = secret_value("ANTACARE_ADMIN_USERNAME", "anta") or "anta"
+        try:
+            admin_cfg = st.secrets.get("antacare", {})
+        except Exception:
+            admin_cfg = {}
+        if not admin_password and admin_cfg:
+            admin_password = str(admin_cfg.get("admin_password", "")).strip()
+        if username == "anta" and admin_cfg and admin_cfg.get("admin_username"):
+            username = str(admin_cfg.get("admin_username")).strip()
         count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         if count == 0 and admin_password:
             if len(admin_password) < 14:
