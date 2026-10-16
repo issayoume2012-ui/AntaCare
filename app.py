@@ -572,28 +572,66 @@ if tabs[2].open:
                     st.rerun()
         with list_tab:
             search = st.text_input("Recherche par code, nom, prénom ou téléphone")
-            df = read_df("""SELECT id,patient_code AS Code,first_name AS Prénom,last_name AS Nom,birth_date AS Naissance,phone AS Téléphone,locality AS Localité,created_at AS "Créé le"
-            FROM patients WHERE patient_code LIKE ? OR first_name LIKE ? OR last_name LIKE ? OR phone LIKE ? ORDER BY last_name""",
+            df = read_df("""SELECT id,patient_code AS "Code",first_name AS "Prénom",last_name AS "Nom",birth_date AS "Naissance",phone AS "Téléphone",locality AS "Localité",created_at AS "Créé le"
+            FROM patients WHERE patient_code ILIKE ? OR first_name ILIKE ? OR last_name ILIKE ? OR phone ILIKE ? ORDER BY last_name""",
             tuple([f"%{search}%"]*4))
+            # Alias SQL explicitement quotés pour préserver les noms de colonnes
+            # (PostgreSQL convertit les alias non quotés en minuscules).
             render_table(df)
-            if not df.empty:
-                selected_code = st.selectbox("Ouvrir le dossier", df["Code"].tolist(), key="patient_open_code")
+            # Tolérance aux anciens résultats/versions de schéma : ne pas planter si
+            # un alias arrive en minuscules ou si aucun dossier ne correspond.
+            code_col = next((c for c in df.columns if str(c).casefold() == "code"), None)
+            if not df.empty and code_col:
+                selected_code = st.selectbox("Ouvrir le dossier", df[code_col].dropna().astype(str).tolist(), key="patient_open_code")
                 with get_conn() as conn:
                     p = conn.execute("SELECT * FROM patients WHERE patient_code=?", (selected_code,)).fetchone()
-                    visits = conn.execute("SELECT visit_date,visit_type,reason,observations,next_visit FROM visits WHERE patient_id=? ORDER BY visit_date DESC", (p["id"],)).fetchall()
-                    preg = conn.execute("SELECT * FROM pregnancies WHERE patient_id=? ORDER BY id DESC", (p["id"],)).fetchall()
-                    post = conn.execute("SELECT * FROM postpartum WHERE patient_id=? ORDER BY id DESC", (p["id"],)).fetchall()
-                st.markdown(f"#### {p['last_name']} {p['first_name']} · {p['patient_code']}")
-                q1,q2,q3 = st.columns(3)
-                q1.write(f"**Naissance :** {p['birth_date'] or 'Non renseignée'}")
-                q2.write(f"**Téléphone :** {p['phone'] or 'Non renseigné'}")
-                q3.write(f"**Localité :** {p['locality'] or 'Non renseignée'}")
-                with st.expander("Historique des consultations"):
-                    render_table(pd.DataFrame([dict(r) for r in visits]))
-                with st.expander("Suivis de grossesse"):
-                    render_table(pd.DataFrame([dict(r) for r in preg]))
-                with st.expander("Suivis post-partum"):
-                    render_table(pd.DataFrame([dict(r) for r in post]))
+                    if p:
+                        visits = conn.execute("SELECT visit_date,visit_type,reason,observations,next_visit FROM visits WHERE patient_id=? ORDER BY visit_date DESC", (p["id"],)).fetchall()
+                        preg = conn.execute("SELECT * FROM pregnancies WHERE patient_id=? ORDER BY id DESC", (p["id"],)).fetchall()
+                        post = conn.execute("SELECT * FROM postpartum WHERE patient_id=? ORDER BY id DESC", (p["id"],)).fetchall()
+                    else:
+                        visits, preg, post = [], [], []
+                if p:
+                    st.markdown(f"#### {p['last_name']} {p['first_name']} · {p['patient_code']}")
+                    q1,q2,q3 = st.columns(3)
+                    q1.write(f"**Naissance :** {p['birth_date'] or 'Non renseignée'}")
+                    q2.write(f"**Téléphone :** {p['phone'] or 'Non renseigné'}")
+                    q3.write(f"**Localité :** {p['locality'] or 'Non renseignée'}")
+                    with st.expander("✏️ Modifier les informations du dossier", expanded=False):
+                        with st.form(f"edit_patient_{p['id']}"):
+                            e1,e2 = st.columns(2)
+                            edit_first = e1.text_input("Prénom *", value=p["first_name"] or "")
+                            edit_last = e2.text_input("Nom *", value=p["last_name"] or "")
+                            e3,e4 = st.columns(2)
+                            try:
+                                birth_value = date.fromisoformat(str(p["birth_date"])[:10]) if p["birth_date"] else None
+                            except (TypeError, ValueError):
+                                birth_value = None
+                            edit_birth = e3.date_input("Date de naissance", value=birth_value, min_value=date(1900,1,1), max_value=date.today())
+                            edit_phone = e4.text_input("Téléphone", value=p["phone"] or "")
+                            edit_locality = st.text_input("Localité / quartier", value=p["locality"] or "")
+                            edit_emergency = st.text_input("Contact à prévenir", value=p["emergency_contact"] or "")
+                            edit_notes = st.text_area("Notes administratives non cliniques", value=p["notes"] or "")
+                            update_patient = st.form_submit_button("💾 Enregistrer les modifications", type="primary")
+                        if update_patient:
+                            if not edit_first.strip() or not edit_last.strip():
+                                st.error("Le prénom et le nom sont obligatoires.")
+                            else:
+                                with get_conn() as conn:
+                                    conn.execute("UPDATE patients SET first_name=?,last_name=?,birth_date=?,phone=?,locality=?,emergency_contact=?,notes=? WHERE id=?", (edit_first.strip(), edit_last.strip(), edit_birth.isoformat() if edit_birth else None, edit_phone.strip(), edit_locality.strip(), edit_emergency.strip(), edit_notes.strip(), p["id"]))
+                                log_action("Modification dossier patiente", "patient", int(p["id"]))
+                                st.success("Dossier patiente mis à jour.")
+                                st.rerun()
+                    with st.expander("Historique des consultations"):
+                        render_table(pd.DataFrame([dict(r) for r in visits]))
+                    with st.expander("Suivis de grossesse"):
+                        render_table(pd.DataFrame([dict(r) for r in preg]))
+                    with st.expander("Suivis post-partum"):
+                        render_table(pd.DataFrame([dict(r) for r in post]))
+            elif df.empty:
+                st.info("Aucune patiente ne correspond à cette recherche.")
+            else:
+                st.warning("La colonne Code est absente des résultats. Vérifiez la requête de recherche des patientes.")
         with preg_tab:
             options = get_patient_map()
             if not options:
