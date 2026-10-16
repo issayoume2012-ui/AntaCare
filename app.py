@@ -72,19 +72,29 @@ div[data-testid="stMetric"]:hover { transform:translateY(-3px); box-shadow:0 12p
 """, unsafe_allow_html=True)
 
 # ---------------------- Database PostgreSQL / Supabase ----------------------
-# Secrets pris en charge depuis les variables d'environnement OU st.secrets
-# (Streamlit Community Cloud). Aucun identifiant n'est codé en dur.
-def secret_value(key, default=""):
-    value = os.environ.get(key)
-    if value is not None and value.strip():
-        return value.strip()
+# Accepte soit DATABASE_URL, soit les secrets structurés [supabase] de Streamlit.
+# Ne placez jamais les identifiants de base dans le code source.
+def _secret_value(section, key, default=""):
     try:
-        value = st.secrets.get(key, default)
+        value = st.secrets.get(section, {}).get(key, default)
         return str(value).strip() if value is not None else default
     except Exception:
         return default
 
-DATABASE_URL = secret_value("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+DB_CONFIG = {}
+
+if not DATABASE_URL:
+    DB_CONFIG = {
+        "host": _secret_value("supabase", "host") or os.environ.get("SUPABASE_DB_HOST", "").strip(),
+        "port": int(_secret_value("supabase", "port", "5432") or os.environ.get("SUPABASE_DB_PORT", "5432")),
+        "dbname": _secret_value("supabase", "dbname") or _secret_value("supabase", "database") or os.environ.get("SUPABASE_DB_NAME", "postgres").strip(),
+        "user": _secret_value("supabase", "user") or os.environ.get("SUPABASE_DB_USER", "").strip(),
+        "password": _secret_value("supabase", "password") or os.environ.get("SUPABASE_DB_PASSWORD", ""),
+        "sslmode": "require",
+        "connect_timeout": 15,
+        "application_name": "ANTACARE",
+    }
 
 class CursorCompat:
     """Adaptateur limité pour conserver les appels SQLite existants sans exposer SQL brut."""
@@ -126,32 +136,21 @@ class ConnectionCompat:
     def rollback(self): self.raw.rollback()
 
 def get_conn():
-    connect_options = {
-        "sslmode": "verify-full",
-        "connect_timeout": 10,
-        "application_name": "ANTACARE",
-    }
     if DATABASE_URL:
-        # sslmode est imposé ici même si l'URI fournie ne le contient pas.
-        raw = psycopg2.connect(DATABASE_URL, **connect_options)
-    else:
-        # Alternative recommandée sur Streamlit Cloud : champs TOML séparés,
-        # afin d'éviter les problèmes d'encodage du mot de passe dans une URI.
-        try:
-            cfg = st.secrets.get("supabase", {})
-        except Exception:
-            cfg = {}
-        host = str(cfg.get("host", "")).strip() if cfg else ""
-        if not host:
-            raise RuntimeError("Secrets Supabase absents : configurez [supabase] ou DATABASE_URL.")
         raw = psycopg2.connect(
-            host=host,
-            port=int(cfg.get("port", 5432)),
-            dbname=str(cfg.get("dbname", "postgres")),
-            user=str(cfg.get("user", "")),
-            password=str(cfg.get("password", "")),
-            **connect_options,
+            DATABASE_URL,
+            sslmode="require",
+            connect_timeout=15,
+            application_name="ANTACARE",
         )
+    else:
+        missing = [key for key in ("host", "user", "password") if not DB_CONFIG.get(key)]
+        if missing:
+            raise RuntimeError(
+                "Configuration Supabase incomplète dans les secrets Streamlit [supabase]. "
+                "Champs manquants : " + ", ".join(missing)
+            )
+        raw = psycopg2.connect(**DB_CONFIG)
     raw.set_session(autocommit=False)
     return ConnectionCompat(raw)
 
@@ -207,16 +206,15 @@ def init_db():
     with get_conn() as conn:
         conn.executescript(schema)
         # Pas de compte/mot de passe de démonstration codé en dur.
-        admin_password = secret_value("ANTACARE_ADMIN_PASSWORD")
-        username = secret_value("ANTACARE_ADMIN_USERNAME", "anta") or "anta"
-        try:
-            admin_cfg = st.secrets.get("antacare", {})
-        except Exception:
-            admin_cfg = {}
-        if not admin_password and admin_cfg:
-            admin_password = str(admin_cfg.get("admin_password", "")).strip()
-        if username == "anta" and admin_cfg and admin_cfg.get("admin_username"):
-            username = str(admin_cfg.get("admin_username")).strip()
+        # Les identifiants peuvent être fournis dans [antacare] sur Streamlit Cloud.
+        admin_password = (
+            _secret_value("antacare", "admin_password")
+            or os.environ.get("ANTACARE_ADMIN_PASSWORD", "")
+        )
+        username = (
+            _secret_value("antacare", "admin_username", "anta")
+            or os.environ.get("ANTACARE_ADMIN_USERNAME", "anta")
+        ).strip()
         count = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
         if count == 0 and admin_password:
             if len(admin_password) < 14:
@@ -248,7 +246,13 @@ def change_password(username, new_password):
 try:
     init_db()
 except Exception as exc:
-    st.error("Connexion PostgreSQL impossible ou initialisation échouée. Vérifiez les secrets DATABASE_URL et l'accès réseau Supabase.")
+    st.error(
+        "Connexion PostgreSQL impossible ou initialisation échouée. "
+        "Vérifiez les secrets Streamlit [supabase] (host, port, dbname, user, password), "
+        "le mot de passe PostgreSQL Supabase et l'accès réseau."
+    )
+    # Diagnostic sans afficher l'URL complète ni les identifiants.
+    st.caption(f"Diagnostic technique : {type(exc).__name__} — {str(exc)[:350]}")
     st.stop()
 
 # ---------------------- Helpers ----------------------
